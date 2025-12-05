@@ -27,27 +27,38 @@
 - 启动时自动创建表；提供会话依赖用于注册/登录。
 
 ## 认证与授权
-- 注册：`POST /register`，接收 `username`、`password`，写入哈希后的密码。
-- 登录：`POST /login`，校验用户名密码，返回 `JWT token`（载荷含 `sub=user_id`、`exp`）。
+- 注册：`POST /api/register`，接收 `username`、`password`，写入哈希后的密码。
+- 登录：`POST /api/login`，校验用户名密码，返回 `JWT token`（载荷含 `sub=user_id`、`exp`）。
+- 房间接口（需携带 `Authorization: Bearer <token>`）：
+  - 列表：`GET /api/rooms`
+  - 创建：`POST /api/rooms`，请求体：`{ "name": "<房间名>" }`
+  - 加入检查：`POST /api/rooms/{room_id}/join-check`，返回 `player_count/capacity/full`
+  - 离开：`POST /api/rooms/{room_id}/leave`
 - WebSocket 鉴权：
   - 连接 `/ws/{room_id}` 时携带 JWT：优先读取 `Authorization: Bearer <token>`，其次读查询参数 `?token=`。
   - 解析失败或过期则拒绝连接（`1008 Policy Violation`）。
 
 ## Redis 数据结构
-- 成员集合：`room:{room_id}:members`（Set，成员为 `player_id`）。
-- 玩家状态：`room:{room_id}:player:{player_id}`（Hash：`x`、`y`、`color`）。
-- 加入：`SADD members`、初始化 `HSET player`。
-- 移动：`HSET player x y`。
-- 离开：`SREM members`、`DEL player`。
+- 成员集合：`room:{room_id}:members`（Set，成员为 `player_id`）
+- 玩家状态：`room:{room_id}:player:{player_id}`（Hash：`x`、`y`、`color`、`player_type`、`last_seen`）
+- 球状态：`room:{room_id}:ball`（Hash：`x`、`y`、`vx`、`vy`、`ts`）
+- 房间元信息：`room:{room_id}:meta`（Hash：`name`、`game_started`）
+- 房间列表集合：`rooms`（Set，成员为 `room_id`）
+- 加入：`SADD members`、初始化 `HSET player`
+- 移动：`HSET player x y`
+- 离开：`SREM members`、`DEL player`（以及可能清理历史键 `room:{room_id}:ball:{player_id}`）
 
 ## WebSocket 流程
 - 加入：
-  - 生成 `player_id`（采用用户 `id`），分配随机颜色，初始坐标 `(0,0)`；写入 Redis。
-  - 将连接加入房间管理映射；广播 `{"type":"join","player_id":...}`。
-  - 立即广播一次当前房间 `state`（聚合所有玩家）。
+  - 服务端根据当前房间分配 `player_type`（A/B），返回随机 `color` 与初始坐标（基于世界尺寸）。
+  - 广播 `{"type":"join","player_id":...,"player_type":"A|B"}`。
+  - 后台状态循环按间隔广播 `state`。
 - 收到消息：
-  - `{"type":"move","x":...,"y":...}`：更新 Redis；更新内存状态；广播 `{"type":"state","players":[...]}` 给房间所有连接。
-  - `{"type":"ping"}`：回复 `{"type":"pong"}` 并刷新心跳时间。
+  - `{"type":"move","x":...,"y":...}`：更新内存与 Redis；标记 `state_dirty`；由后台循环定期广播 `{"type":"state","players":[...]}`。
+  - `{"type":"init","width":...,"height":...}`：设置世界尺寸（用于居中出生点与半场判断）。
+  - `{"type":"ball","x":...,"y":...,"vx":...,"vy":...}`：记录球状态并立即广播 `{"type":"ball",...}`。
+  - `{"type":"start_game"}`：置 `game_started` 并广播 `{"type":"game_started"}`。
+  - `{"type":"ping"}`：验证 Token 有效并回复 `{"type":"pong"}`，刷新 `last_seen`。
 - 断开或超时：
   - 从房间移除；清理 Redis；广播 `{"type":"leave","player_id":...}`。
 
@@ -58,9 +69,10 @@
 
 ## 房间管理实现要点
 - `WebSocketRoomManager`：
-  - 字典 `rooms: Dict[str, RoomState]`；`RoomState` 包含：连接集合、玩家字典（含颜色、坐标、last_seen）、异步锁。
-  - 方法：`join()`、`leave()`、`broadcast()`、`broadcast_state()`、`update_position()`、`kick_inactive()`。
-  - 所有广播与集合操作均在房间级锁下进行，避免竞态。
+  - `rooms: Dict[str, RoomState>`；`RoomState`：`connections`、`players`、`ball`、`world_width/height`、`game_started`、`state_dirty`、`state_task`、`broadcast_interval`。
+  - 方法：`join()`、`leave()`、`update_position()`、`broadcast_state()`、`record_ball()`、`set_world()`、`start_game()`、`get_rooms()`、`create_room()`、`kick_inactive_loop()`。
+  - 并发控制：房间级 `asyncio.Lock`；广播在锁外进行；状态广播由 `state_task` 按 `broadcast_interval` 触发。
+  - 房间容量：`room_capacity=2`（可调整）。
 
 ## 错误处理与健壮性
 - DB/Redis 操作使用 `try/except` 包装，记录错误并给出友好响应（HTTP 400/401/500）。
@@ -81,10 +93,11 @@
 
 ## 启动与验证
 - 安装依赖：`pip install -r requirements.txt`
-- 启动命令：`uvicorn main:app --reload`
+- 启动命令：`uvicorn main:app --reload --port 9992`
 - 验证流程：
-  - 调用 `/register`、`/login` 获取 `JWT`。
-  - 使用 `JWT` 连接 `ws://localhost:8000/ws/default`（Header `Authorization: Bearer <token>`）。
-  - 发送 `move` 消息观察 `state` 广播；定时 `ping` 收到 `pong`；断开后收到 `leave`。
+  - 调用 `/api/register`、`/api/login` 获取 `JWT`。
+  - `GET /api/rooms` 或 `POST /api/rooms` 创建房间，并用 `POST /api/rooms/{room_id}/join-check` 检查容量。
+  - 使用 `JWT` 连接 `ws://localhost:9992/ws/{room_id}`（Header `Authorization: Bearer <token>` 或 `?token=`）。
+  - 发送 `move` 观察 `state` 广播；定时 `ping` 收到 `pong`；断开后收到 `leave`。
 
 请确认该方案，确认后我将直接输出完整可运行的项目代码（按文件分隔且包含中文注释）。

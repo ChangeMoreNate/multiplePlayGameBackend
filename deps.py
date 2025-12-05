@@ -99,3 +99,14 @@ async def get_redis() -> Redis:
     if _redis_client is None:
         _redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
     return _redis_client
+
+
+async def close_redis() -> None:
+    """关闭 Redis 客户端连接"""
+    global _redis_client
+    try:
+        if _redis_client is not None:
+            await _redis_client.close()
+            _redis_client = None
+    except Exception:
+        pass

@@ -8,7 +8,7 @@ import time
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -22,9 +22,10 @@ from deps import (
     verify_password,
     get_password_hash,
     decode_token_user_id,
+    close_redis,
 )
 from websocket_manager import WebSocketRoomManager
-from models import UserCreate, UserLogin, Token
+from models import UserCreate, UserLogin, Token, RoomCreate
 
 
 app = FastAPI(title="Realtime Position Sync Demo")
@@ -64,18 +65,39 @@ async def on_startup():
     except Exception as e:
         print(f"[启动警告] Redis 连接失败：{e}")
 
-    app.state.ws_manager = WebSocketRoomManager(redis)
+    try:
+        kick_timeout_env = os.getenv("WS_KICK_TIMEOUT_SECONDS")
+        scan_interval_env = os.getenv("WS_SCAN_INTERVAL_SECONDS")
+        kick_timeout = int(kick_timeout_env) if kick_timeout_env else 20
+        scan_interval = int(scan_interval_env) if scan_interval_env else 5
+    except Exception:
+        kick_timeout = 20
+        scan_interval = 5
+    app.state.ws_manager = WebSocketRoomManager(redis, kick_timeout_seconds=kick_timeout, scan_interval_seconds=scan_interval)
     app.state.kick_task = asyncio.create_task(app.state.ws_manager.kick_inactive_loop())
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
     """关闭事件：取消后台任务"""
-
     try:
         task = getattr(app.state, "kick_task", None)
         if task:
             task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        manager = getattr(app.state, "ws_manager", None)
+        if manager:
+            await manager.shutdown()
+    except Exception:
+        pass
+    try:
+        await close_redis()
     except Exception:
         pass
 
@@ -126,6 +148,70 @@ async def login(payload: UserLogin, session: AsyncSession = Depends(get_session)
         raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"登录失败: {e}")
+
+
+@app.get("/api/rooms")
+async def list_rooms(request: Request):
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未授权")
+    token = auth.split(" ", 1)[1].strip()
+    user_id = decode_token_user_id(token)
+    if user_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未授权")
+    manager: WebSocketRoomManager = app.state.ws_manager
+    rooms = await manager.get_rooms()
+    return rooms
+
+
+@app.post("/api/rooms")
+async def create_room(payload: RoomCreate, request: Request):
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未授权")
+    token = auth.split(" ", 1)[1].strip()
+    user_id = decode_token_user_id(token)
+    if user_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未授权")
+    manager: WebSocketRoomManager = app.state.ws_manager
+    room_id = await manager.create_room(payload.name)
+    return {"room_id": room_id, "name": payload.name, "player_count": 0}
+
+
+@app.post("/api/rooms/{room_id}/join-check")
+async def join_check(room_id: str, request: Request):
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未授权")
+    token = auth.split(" ", 1)[1].strip()
+    user_id = decode_token_user_id(token)
+    if user_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未授权")
+    manager: WebSocketRoomManager = app.state.ws_manager
+    try:
+        count = await manager.get_player_count(room_id)
+    except Exception:
+        count = 0
+    capacity = getattr(manager, "room_capacity", 2)
+    full = bool(count >= capacity)
+    return {"room_id": room_id, "player_count": count, "capacity": capacity, "full": full}
+
+
+@app.post("/api/rooms/{room_id}/leave")
+async def leave_room(room_id: str, request: Request):
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未授权")
+    token = auth.split(" ", 1)[1].strip()
+    user_id = decode_token_user_id(token)
+    if user_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未授权")
+    manager: WebSocketRoomManager = app.state.ws_manager
+    try:
+        await manager.leave(room_id, str(user_id))
+    except Exception:
+        pass
+    return {"ok": True}
 
 
 def _extract_token(websocket: WebSocket) -> Optional[str]:
@@ -182,12 +268,29 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
     manager: WebSocketRoomManager = app.state.ws_manager
     player_id = str(user_id)
 
+    # 若前端在握手时通过 query 传递了世界尺寸，则先设置，保证 join 使用到像素坐标
+    try:
+        q_width = websocket.query_params.get("width")
+        q_height = websocket.query_params.get("height")
+        if q_width is not None and q_height is not None:
+            width = float(q_width)
+            height = float(q_height)
+            if width > 0 and height > 0:
+                await manager.set_world(room_id, width, height)
+    except Exception:
+        pass
+
     # 加入房间并广播
     try:
         await manager.join(room_id, player_id, websocket)
-    except Exception:
-        # 无法加入则关闭
-        await websocket.close()
+    except Exception as e:
+        try:
+            msg = "room_full" if str(e) == "room_full" else "join_failed"
+            await websocket.send_json({"type": "error", "message": msg})
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+        await websocket.close(code=1003)
         return
     # 消息循环
     try:
@@ -208,6 +311,30 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 except Exception:
                     continue
                 await manager.update_position(room_id, player_id, x, y)
+            elif msg_type == "init":
+                try:
+                    width = float(data.get("width"))
+                    height = float(data.get("height"))
+                except Exception:
+                    continue
+                spawn_y_ratio = 1.0/3.0 if str(player_id) == "1" else (2.0/3.0 if str(player_id) == "2" else 0.5)
+                x_px = width / 2.0
+                y_px = height * spawn_y_ratio
+                await manager.update_position(room_id, player_id, x_px, y_px)
+            elif msg_type == "ball":
+                try:
+                    bx = float(data.get("x", 0.0))
+                    by = float(data.get("y", 0.0))
+                    vx = float(data.get("vx", 0.0))
+                    vy = float(data.get("vy", 0.0))
+                except Exception:
+                    continue
+                await manager.record_ball(room_id, bx, by, vx, vy)
+            elif msg_type == "start_game":
+                try:
+                    await manager.start_game(room_id)
+                except Exception:
+                    pass
             elif msg_type == "ping":
                 # 在心跳时验证 Token 是否仍有效，若失效则通知前端并断开
                 if decode_token_user_id(token) is None:

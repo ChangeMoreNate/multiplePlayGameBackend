@@ -67,3 +67,6 @@ class UserOut(BaseModel):
     id: int
     username: str
     created_at: Optional[str] = None
+
+class RoomCreate(BaseModel):
+    name: str
